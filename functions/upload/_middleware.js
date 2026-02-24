@@ -1,3 +1,8 @@
+import { DOMParser } from '@xmldom/xmldom';
+if (typeof globalThis.DOMParser === 'undefined') {
+    globalThis.DOMParser = DOMParser;
+}
+
 import { errorHandling, telemetryData, checkDatabaseConfig } from '../utils/middleware';
 
 // CORS 跨域响应头

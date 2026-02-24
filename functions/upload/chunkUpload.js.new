@@ -1,0 +1,358 @@
+/* ======= 客户端分块上传处理 ======= */
+import { createResponse, selectConsistentChannel, getUploadIp, getIPAddress, buildUniqueFileId, endUpload } from './uploadTools';
+import { TelegramAPI } from '../utils/telegramAPI';
+import { DiscordAPI } from '../utils/discordAPI';
+import { S3Client, CreateMultipartUploadCommand, UploadPartCommand, AbortMultipartUploadCommand } from "@aws-sdk/client-s3";
+import { getDatabase, checkDatabaseConfig } from '../utils/databaseAdapter.js';
+
+// 初始化分块上传
+export async function initializeChunkedUpload(context) {
+    const { request, env, url } = context;
+    const db = getDatabase(env);
+
+    try {
+        // 解析表单数据
+        const formdata = await request.formData();
+
+        const originalFileName = formdata.get('originalFileName');
+        const originalFileType = formdata.get('originalFileType');
+        const totalChunks = parseInt(formdata.get('totalChunks'));
+
+        if (!originalFileName || !originalFileType || !totalChunks) {
+            return createResponse('Error: Missing initialization parameters', { status: 400 });
+        }
+
+        // 生成唯一的 uploadId
+        const timestamp = Date.now();
+        const random = Math.random().toString(36).slice(2, 11);
+        const uploadId = `upload_${timestamp}_${random}`;
+
+        // 获取上传IP
+        const uploadIp = getUploadIp(request);
+        const ipAddress = await getIPAddress(uploadIp);
+
+        // 获取上传渠道
+        const uploadChannel = url.searchParams.get('uploadChannel') || 'telegram';
+        // 获取指定的渠道名称
+        const channelName = url.searchParams.get('channelName') || '';
+
+        // 存储上传会话信息
+        const sessionInfo = {
+            uploadId,
+            originalFileName,
+            originalFileType,
+            totalChunks,
+            uploadChannel,
+            channelName,
+            uploadIp,
+            ipAddress,
+            status: 'initialized',
+            createdAt: timestamp,
+            expiresAt: timestamp + 3600000 // 1小时过期
+        };
+
+        // 保存会话信息
+        const sessionKey = `upload_session_${uploadId}`;
+        await db.put(sessionKey, JSON.stringify(sessionInfo), {
+            expirationTtl: 3600 // 1小时过期
+        });
+
+        return createResponse(JSON.stringify({
+            success: true,
+            uploadId,
+            message: 'Chunked upload initialized successfully',
+            sessionInfo: {
+                uploadId,
+                originalFileName,
+                totalChunks,
+                uploadChannel,
+                channelName
+            }
+        }), {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' }
+        });
+
+    } catch (error) {
+        return createResponse(`Error: Failed to initialize chunked upload - ${error.message}`, { status: 500 });
+    }
+}
+
+// 处理客户端分块上传
+export async function handleChunkUpload(context) {
+    const { env, request, url, waitUntil } = context;
+    const db = getDatabase(env);
+
+    // 解析表单数据
+    const formdata = await request.formData();
+    context.formdata = formdata;
+
+    try {
+        const chunk = formdata.get('file');
+        const chunkIndex = parseInt(formdata.get('chunkIndex'));
+        const totalChunks = parseInt(formdata.get('totalChunks'));
+        const uploadId = formdata.get('uploadId');
+        const originalFileName = formdata.get('originalFileName');
+        const originalFileType = formdata.get('originalFileType');
+
+        if (!chunk || chunkIndex === null || !totalChunks || !uploadId || !originalFileName || !originalFileType) {
+            return createResponse('Error: Missing chunk upload parameters', { status: 400 });
+        }
+
+        // 验证上传会话
+        const sessionKey = `upload_session_${uploadId}`;
+        const sessionData = await db.get(sessionKey);
+        if (!sessionData) {
+            return createResponse('Error: Invalid or expired upload session', { status: 400 });
+        }
+
+        const sessionInfo = JSON.parse(sessionData);
+
+        // 验证会话信息
+        if (sessionInfo.originalFileName !== originalFileName ||
+            sessionInfo.totalChunks !== totalChunks) {
+            return createResponse('Error: Session parameters mismatch', { status: 400 });
+        }
+
+        // 检查会话是否过期
+        if (Date.now() > sessionInfo.expiresAt) {
+            return createResponse('Error: Upload session expired', { status: 410 });
+        }
+
+        // 获取上传渠道
+        const uploadChannel = url.searchParams.get('uploadChannel') || sessionInfo.uploadChannel || 'telegram';
+        // 获取指定的渠道名称
+        const channelName = url.searchParams.get('channelName') || sessionInfo.channelName || '';
+
+        // 将渠道名称存入 context
+        context.specifiedChannelName = channelName;
+
+        // 立即创建分块记录，标记为"uploading"状态
+        const chunkKey = `chunk_${uploadId}_${chunkIndex.toString().padStart(3, '0')}`;
+        const chunkData = await chunk.arrayBuffer();
+        const uploadStartTime = Date.now();
+        const initialChunkMetadata = {
+            uploadId,
+            chunkIndex,
+            totalChunks,
+            originalFileName,
+            originalFileType,
+            chunkSize: chunkData.byteLength,
+            uploadTime: uploadStartTime,
+            uploadStartTime: uploadStartTime,
+            status: 'uploading',
+            uploadChannel,
+            timeoutThreshold: uploadStartTime + 60000 // 1分钟超时阈值
+        };
+
+        // D1 模式只存元数据（value 为空字符串），KV 模式存完整二进制数据
+        // D1 的 TEXT 字段无法存储大型二进制数据（SQLITE_TOOBIG），分块数据直接传参处理
+        const { usingD1 } = checkDatabaseConfig(env);
+        await db.put(chunkKey, usingD1 ? '' : chunkData, {
+            metadata: initialChunkMetadata,
+            expirationTtl: 3600 // 1小时过期
+        });
+
+        // 同步上传分块到存储端，D1 模式直接传入 chunkData 避免再从数据库读取
+        await uploadChunkToStorageWithTimeout(context, chunkIndex, totalChunks, uploadId, originalFileName, originalFileType, uploadChannel, usingD1 ? chunkData : undefined);
+
+        return createResponse(JSON.stringify({
+            success: true,
+            message: `Chunk ${chunkIndex + 1}/${totalChunks} received and being uploaded`,
+            uploadId,
+            chunkIndex
+        }), {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' }
+        });
+
+    } catch (error) {
+        return createResponse(`Error: Failed to upload chunk - ${error.message}`, { status: 500 });
+    }
+}
+
+// 处理清理请求
+export async function handleCleanupRequest(context, uploadId, totalChunks) {
+    try {
+        if (!uploadId) {
+            return createResponse(JSON.stringify({
+                error: 'Missing uploadId parameter'
+            }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+        }
+
+        // 强制清理所有相关数据
+        await forceCleanupUpload(context, uploadId, totalChunks);
+
+        return createResponse(JSON.stringify({
+            success: true,
+            message: `Cleanup completed for upload ${uploadId}`,
+            uploadId: uploadId,
+            cleanedChunks: totalChunks
+        }), {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' }
+        });
+
+    } catch (error) {
+        return createResponse(JSON.stringify({
+            error: `Cleanup failed: ${error.message}`,
+            uploadId: uploadId
+        }), { status: 500, headers: { 'Content-Type': 'application/json' } });
+    }
+}
+
+/* ======= 单个分块上传到不同渠道的存储端 ======= */
+
+// 带超时保护的异步上传分块到存储端
+// chunkData: D1 模式下由调用方直接传入，KV 模式下为 undefined（从数据库读取）
+async function uploadChunkToStorageWithTimeout(context, chunkIndex, totalChunks, uploadId, originalFileName, originalFileType, uploadChannel, chunkData) {
+    const { env } = context;
+    const db = getDatabase(env);
+    const chunkKey = `chunk_${uploadId}_${chunkIndex.toString().padStart(3, '0')}`;
+    const UPLOAD_TIMEOUT = 180000; // 3分钟超时
+
+    try {
+        // 设置超时 Promise
+        const timeoutPromise = new Promise((_, reject) => {
+            setTimeout(() => reject(new Error('Upload timeout')), UPLOAD_TIMEOUT);
+        });
+
+        // 执行实际上传，透传 chunkData
+        const uploadPromise = uploadChunkToStorage(context, chunkIndex, totalChunks, uploadId, originalFileName, originalFileType, uploadChannel, chunkData);
+
+        // 竞速执行
+        await Promise.race([uploadPromise, timeoutPromise]);
+
+    } catch (error) {
+        console.error(`Chunk ${chunkIndex} upload failed or timed out:`, error);
+
+        // 超时或失败时，更新状态为超时/失败
+        try {
+            const chunkRecord = await db.getWithMetadata(chunkKey);
+            if (chunkRecord && chunkRecord.metadata) {
+                const isTimeout = error.message === 'Upload timeout';
+                const errorMetadata = {
+                    ...chunkRecord.metadata,
+                    status: isTimeout ? 'timeout' : 'failed',
+                    error: error.message,
+                    failedTime: Date.now(),
+                    isTimeout: isTimeout
+                };
+
+                // D1 模式不存二进制数据，KV 模式保留原始数据以便重试
+                const { usingD1 } = checkDatabaseConfig(env);
+                await db.put(chunkKey, usingD1 ? '' : (chunkData !== undefined ? chunkData : (chunkRecord.value || '')), {
+                    metadata: errorMetadata,
+                    expirationTtl: 3600
+                });
+            }
+        } catch (metaError) {
+            console.error('Failed to save timeout/error metadata:', metaError);
+        }
+    }
+}
+
+// 异步上传分块到存储端，失败自动重试
+// chunkData: D1 模式下由调用方直接传入，KV 模式下为 undefined（从数据库读取）
+async function uploadChunkToStorage(context, chunkIndex, totalChunks, uploadId, originalFileName, originalFileType, uploadChannel, chunkData) {
+    const { env } = context;
+    const db = getDatabase(env);
+
+    const chunkKey = `chunk_${uploadId}_${chunkIndex.toString().padStart(3, '0')}`;
+    const { usingD1 } = checkDatabaseConfig(env);
+
+    const MAX_RETRIES = 3;
+
+    let chunkMetadata;
+    try {
+        if (chunkData !== undefined) {
+            // D1 模式：chunkData 由调用方直接传入，只读元数据
+            const chunkRecord = await db.getWithMetadata(chunkKey);
+            chunkMetadata = chunkRecord ? chunkRecord.metadata : {};
+        } else {
+            // KV 模式：从数据库读取二进制数据
+            const chunkRecord = await db.getWithMetadata(chunkKey, { type: 'arrayBuffer' });
+            if (!chunkRecord || !chunkRecord.value) {
+                console.error(`Chunk ${chunkIndex} data not found in database`);
+                return;
+            }
+            chunkData = chunkRecord.value;
+            chunkMetadata = chunkRecord.metadata;
+        }
+
+        for (let retry = 0; retry < MAX_RETRIES; retry++) {
+            // 根据渠道上传分块
+            let uploadResult = null;
+
+            if (uploadChannel === 'cfr2') {
+                uploadResult = await uploadSingleChunkToR2Multipart(context, chunkData, chunkIndex, totalChunks, uploadId, originalFileName, originalFileType);
+            } else if (uploadChannel === 's3') {
+                uploadResult = await uploadSingleChunkToS3Multipart(context, chunkData, chunkIndex, totalChunks, uploadId, originalFileName, originalFileType);
+            } else if (uploadChannel === 'telegram') {
+                uploadResult = await uploadSingleChunkToTelegram(context, chunkData, chunkIndex, totalChunks, uploadId, originalFileName, originalFileType);
+            } else if (uploadChannel === 'discord') {
+                uploadResult = await uploadSingleChunkToDiscord(context, chunkData, chunkIndex, totalChunks, uploadId, originalFileName, originalFileType);
+            }
+
+            if (uploadResult && uploadResult.success) {
+                // 上传成功，更新状态并保存上传信息
+                const updatedMetadata = {
+                    ...chunkMetadata,
+                    status: 'completed',
+                    uploadResult: uploadResult,
+                    completedTime: Date.now()
+                };
+
+                // 只保存metadata，不保存原始数据，设置过期时间
+                await db.put(chunkKey, '', {
+                    metadata: updatedMetadata,
+                    expirationTtl: 3600 // 1小时过期
+                });
+
+                console.log(`Chunk ${chunkIndex} uploaded successfully to ${uploadChannel}`);
+
+                break;
+            } else if (retry === MAX_RETRIES - 1) {
+                // 最后一次上传失败，标记为失败状态
+                const failedMetadata = {
+                    ...chunkMetadata,
+                    status: 'failed',
+                    error: uploadResult ? uploadResult.error : 'Unknown error',
+                    failedTime: Date.now()
+                };
+
+                // D1 模式不存二进制数据，KV 模式保留原始数据以便重试
+                await db.put(chunkKey, usingD1 ? '' : chunkData, {
+                    metadata: failedMetadata,
+                    expirationTtl: 3600 // 1小时过期
+                });
+
+                console.warn(`Chunk ${chunkIndex} upload failed: ${failedMetadata.error}`);
+            }
+        }
+
+    } catch (error) {
+        console.error(`Error uploading chunk ${chunkIndex}:`, error);
+
+        // 发生异常时，确保标记为失败
+        try {
+            const chunkRecord = await db.getWithMetadata(chunkKey);
+            if (chunkRecord && chunkRecord.metadata) {
+                const errorMetadata = {
+                    ...chunkRecord.metadata,
+                    status: 'failed',
+                    error: error.message,
+                    failedTime: Date.now()
+                };
+
+                // D1 模式不存二进制数据，KV 模式保留原始数据以便重试
+                await db.put(chunkKey, usingD1 ? '' : (chunkData !== undefined ? chunkData : (chunkRecord.value || '')), {
+                    metadata: errorMetadata,
+                    expirationTtl: 3600 // 1小时过期
+                });
+            }
+        } catch (metaError) {
+            console.error('Failed to save error metadata:', metaError);
+        }
+    }
+}
